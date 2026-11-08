@@ -335,6 +335,32 @@ contradict it are weighted accordingly:
 sherlock-rm --ai --anchor "name=Jane Doe" --anchor "verified:location=Berlin" janedoe
 ```
 
+### People: one profile across several usernames
+
+One person often uses several handles. A **person** groups the usernames you
+believe are theirs, and builds one profile from every page found for any of
+them. Each value says which username's page it came from (`GitHub (alice)`,
+`Mastodon (alice_dev)`).
+
+```bash
+sherlock-rm person suggest                     # what the stored evidence connects
+sherlock-rm person create "Alice Smith" alice alice_dev
+sherlock-rm person build "Alice Smith"         # --anchor works here too
+sherlock-rm person show "Alice Smith" --sources
+```
+
+You make every link yourself. `suggest` only lists pairs whose pages point at
+each other: one lists the other as a handle, links to the other's profile, or
+shows the same email. A shared name or city is never treated as evidence. A
+username belongs to at most one person. `person delete` removes the grouping
+and its profile, and keeps every username and scan result.
+
+In `sherlock-rm ui`, people head the RESULTS list with their usernames nested
+underneath. Opening a person shows the same SITES / EXTRACTIONS / PROFILE
+sections across all of its usernames. On a username, `n` adds it to a person
+and `p` opens the person it belongs to. `g` opens the suggested links, and a
+`+ N suggested` row at the bottom of the list does the same.
+
 ## Accuracy, honestly
 
 **Two fetch engines, and they do not agree.** The browser engine is the default
@@ -475,6 +501,7 @@ sherlock-rm show USERNAME      Read what is stored. Never scans, never writes
 sherlock-rm ui                 Full-screen interface: scan, results and settings
 sherlock-rm setup ai           Configure the local model endpoint
 sherlock-rm settings           Edit stored defaults for scans, output and AI
+sherlock-rm person ...         Group usernames into a person; one profile for all
 ```
 
 `sherlock-rm ui` puts all three in one place and needs a terminal; without one it
@@ -531,6 +558,22 @@ says so and exits rather than failing.
 | `--sources` | Full URL of every site backing each value, instead of a count |
 | `--json` | Machine-readable output |
 | `--verbose`, `-v` | Include diagnostic notes recorded during synthesis |
+
+</details>
+
+<details>
+<summary><strong><code>sherlock-rm person</code> commands</strong></summary>
+
+| Command | Effect |
+| - | - |
+| `list` | Every person and its usernames |
+| `create NAME [USERNAME...]` | Create a person, optionally linking usernames |
+| `link NAME USERNAME...` / `unlink NAME USERNAME...` | Add or remove usernames |
+| `rename OLD NEW` | Rename a person |
+| `delete NAME [--yes]` | Remove the person and its profile. Usernames and results are kept |
+| `suggest` | Pairs of usernames the stored evidence connects, with reasons. Never writes |
+| `show NAME [--sources] [--json] [-v]` | The person's stored profile. Never writes |
+| `build NAME [--anchor ...] [--force] [--analyse]` | Build the profile from every linked username's stored pages |
 
 </details>
 

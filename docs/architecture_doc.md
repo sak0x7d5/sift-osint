@@ -71,6 +71,8 @@ below follows from one of them:
 | `ai_provider.py` | LM Studio REST client | The only module that speaks HTTP to a model |
 | `ai_config.py` / `ai_setup.py` | Persistent endpoint config and its wizard | Config lives in the user config dir |
 | `investigation_context.py` | `--anchor` parsing and deduplication | Anchors are per-run, never persisted |
+| `person_links.py` | Suggest links between stored usernames | Pure apart from one read-only loader; never writes |
+| `person_cli.py` | `sherlock-rm person ...` | Intercepted from argv like `show` and `ui` |
 | `pass_one_runtime.py` | Seed known key names from prior extractions | Keeps Pass 1 key naming stable across sites |
 | `notify.py` | Every byte of terminal output | `rich`-based; no other module prints |
 | `result.py` | `QueryStatus`, `QueryResult` | Inherited from upstream |
@@ -248,6 +250,25 @@ results(id, username_id → usernames.id, site_name, site_url,
         UNIQUE(username_id, site_name))
 ```
 
+Two more tables hold **people**, a named group of usernames with one Pass 2
+profile across all of them:
+
+```
+people(id, name UNIQUE, created_at, profile_summary,
+       profile_summary_input_hash, profile_summary_updated_at)
+
+person_usernames(person_id → people.id, username_id → usernames.id UNIQUE,
+                 linked_at)
+```
+
+`UNIQUE(username_id)` means a username belongs to **at most one** person. If it
+could sit in two, one account's facts would count as evidence for two different
+people. Links are only ever made by hand (`person link`, or accepting a
+suggestion in the UI); `person_links.py` suggests, and never writes.
+`delete_person` removes the group and its profile and never touches a
+username's results, the opposite of `delete_username`, which removes its
+`person_usernames` row before the username.
+
 `ai_extraction_model` is provenance, never a cache key. The contract hash is
 deliberately model-independent, and must stay that way: folding the model into
 it would invalidate every extraction on disk for every username the moment
@@ -273,7 +294,9 @@ optional.
 `CASE` expressions clear `ai_extraction` when the status or response text
 changed, or when `force_ai_extraction` is set — so a changed page automatically
 invalidates its extraction. Any write that touches an extraction also nulls the
-owning username's `profile_summary_input_hash`, which invalidates Pass 2. A
+owning username's `profile_summary_input_hash`, and the hash of the person that
+username belongs to (`_invalidate_profile_summary`), which invalidates Pass 2.
+Linking, unlinking and renaming null the person's hash too. A
 caller cannot forget to do this because a caller never does it.
 
 **The database follows the user, not the working directory.**
@@ -416,6 +439,24 @@ site ids, the investigation context, and — **only in anchored mode** — the m
 key and prompt fingerprints (`profile_synthesis.py:414`). A match against the
 stored `profile_summary_input_hash`, plus a cached summary that parses and
 contains no `failed` decisions, short-circuits Pass 2 entirely.
+
+**Person profiles** use the same gate (`synthesis_pipeline._synthesize` is one
+body for both). Each `SiteExtraction` then carries the `username` its page was
+found under, and the payload gains a per-extraction `username` and a `person`
+key. These are added **only** for a person, so a username profile's payload,
+and therefore every stored username hash, is byte-for-byte what it was
+(`tests/test_people.py` pins one). The person's name and its sorted usernames
+are folded in on top, so an empty person and a username of the same name never
+share a hash.
+
+The per-page username matters beyond the hash. Pass 2 drops the searched
+username echoed back in a page's own facts (`merge_extraction(...,
+username=...)`). For a person that filter uses **each page's own username**
+(`owner_of`), never the person's name: filtering by "Alice Smith" would drop
+the full name "Alice Smith" from every page. It also keeps
+`alice_dev`'s page saying "also alice" as evidence. The new `person`,
+`usernames` and `SourceDecision.username` fields are omitted from a dump while
+unset, so a username profile also serialises exactly as before.
 
 Excluding the model key in aggregate mode is the right asymmetry: deterministic
 merging genuinely does not depend on which model is configured, so swapping

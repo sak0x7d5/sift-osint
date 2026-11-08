@@ -293,6 +293,78 @@ async def _collect(db: SherlockDB, username: str) -> dict[str, Any]:
     }
 
 
+def person_site_label(site_name: str, username: str) -> str:
+    """A site as a person's record names it: with the username it was found under.
+
+    The same form the profile renderer uses for sources, so a row in the SITES
+    table and a source under a profile value read identically.
+    """
+    return f"{site_name} ({username})"
+
+
+async def _collect_person(db: SherlockDB, name: str) -> dict[str, Any]:
+    """`_collect` for a person: every linked username's record, as one.
+
+    Each account and unresolved site is labelled with the username it belongs
+    to, because "GitHub" names one account per linked username. The counts are
+    sums. The profile is the PERSON's, not any username's.
+    """
+    usernames = await db.get_person_usernames(name)
+    if usernames is None:
+        return {"username": name, "person": name, "known": False}
+
+    accounts: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    model_counts: dict[str | None, int] = {}
+    sites_checked = 0
+    pending = 0
+    scanned: list[str] = []
+    contract_hash = pass_one_contract_hash()
+    for username in usernames:
+        overview = await db.get_username_overview(username)
+        if overview is None:
+            continue
+        sites_checked += overview.total_sites
+        if overview.last_scanned_at:
+            scanned.append(str(overview.last_scanned_at))
+        saved_rows = await db.get_saved_results(username)
+        for account in _claimed_accounts(saved_rows):
+            account["username"] = username
+            account["site_name"] = person_site_label(account["site_name"], username)
+            accounts.append(account)
+        for entry in _unresolved_sites(saved_rows):
+            entry["username"] = username
+            entry["site_name"] = person_site_label(entry["site_name"], username)
+            unresolved.append(entry)
+        for model, count in (await db.get_extraction_model_counts(username)).items():
+            model_counts[model] = model_counts.get(model, 0) + count
+        pending += len(
+            await db.get_pending_ai_extraction_ids(username, contract_hash=contract_hash)
+        )
+
+    cache = await db.get_person_profile_cache(name)
+    raw_summary = cache.profile_summary if cache is not None else None
+    return {
+        "username": name,
+        "person": name,
+        "usernames": usernames,
+        "known": True,
+        "last_scanned_at": max(scanned) if scanned else None,
+        "sites_checked": sites_checked,
+        "accounts_found": len(accounts),
+        "accounts": sorted(accounts, key=lambda item: item["site_name"].lower()),
+        "unresolved": sorted(unresolved, key=lambda item: item["site_name"].lower()),
+        "extraction_models": _extraction_models(model_counts),
+        "pending_analysis": pending,
+        "usable_evidence": _usable_evidence(
+            await db.get_person_profile_evidence(name), contract_hash
+        ),
+        "profile_updated_at": cache.updated_at if cache is not None else None,
+        "profile": _load_profile(raw_summary),
+        "profile_unreadable": bool(raw_summary) and _load_profile(raw_summary) is None,
+    }
+
+
 def _report_unresolved(
     reporter: TerminalReporter,
     record: dict[str, Any],

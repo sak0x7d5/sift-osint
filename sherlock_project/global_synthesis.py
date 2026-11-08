@@ -42,6 +42,8 @@ from sherlock_project.profile_synthesis import (
     is_username_variant,
     merge_extraction,
     normalize_value,
+    owner_of,
+    searched_handles,
 )
 
 # A chunk is one request. Thirty compact extractions is roughly 6-10K tokens,
@@ -124,15 +126,19 @@ def site_refs(extractions: Sequence[SiteExtraction]) -> dict[str, SiteExtraction
     return {f"s{index}": extraction for index, extraction in enumerate(ordered, start=1)}
 
 
-def _anchor_facts(context: InvestigationContext, username: str) -> set[tuple[str, str]]:
+def _anchor_facts(
+    context: InvestigationContext, handles: Iterable[str]
+) -> set[tuple[str, str]]:
+    handles = list(handles)
     return {
         (canonical_field(anchor.field), normalize_value(anchor.field, anchor.value))
         for anchor in context.anchors
-        if not is_username_variant(anchor.value, username)
+        if not any(is_username_variant(anchor.value, handle) for handle in handles)
     }
 
 
-def _link_targets(extraction: Mapping[str, Any]) -> set[str]:
+def link_targets(extraction: Mapping[str, Any]) -> set[str]:
+    """Every URL an extraction points at, normalised for comparison."""
     targets: set[str] = set()
     for key, raw in extraction.items():
         for value in _values(raw):
@@ -158,17 +164,19 @@ def deterministic_round(
     makes a profile strong, its links make the profiles it points at strong,
     and their emails can match a fourth.
     """
-    anchor_facts = _anchor_facts(context, username)
+    anchor_facts = _anchor_facts(context, searched_handles(username, sites.values()))
     changed_any = False
     while True:
         strong = [ref for ref, verdict in verdicts.items() if verdict.status == "strong_match"]
         linked_from_strong: set[str] = set()
         identifiers: set[tuple[str, str]] = set()
         for ref in strong:
-            linked_from_strong |= _link_targets(sites[ref].extraction)
+            linked_from_strong |= link_targets(sites[ref].extraction)
             identifiers |= {
                 fact
-                for fact in normalized_facts(sites[ref].extraction, username)
+                for fact in normalized_facts(
+                    sites[ref].extraction, owner_of(sites[ref], username)
+                )
                 if fact[0] in _UNIQUE_IDENTIFIER_FIELDS
             }
         changed = False
@@ -176,7 +184,7 @@ def deterministic_round(
             current = verdicts.get(ref)
             if current is not None and current.status == "strong_match":
                 continue
-            facts = normalized_facts(site.extraction, username)
+            facts = normalized_facts(site.extraction, owner_of(site, username))
             own_url = normalize_value("url", site.site_url) if site.site_url else None
             if (
                 facts & anchor_facts
@@ -200,7 +208,9 @@ def strong_profile_of(
     for ref in sorted(sites, key=lambda ref: sites[ref].site_id):
         verdict = verdicts.get(ref)
         if verdict is not None and verdict.status == "strong_match":
-            merge_extraction(profile, sites[ref].extraction, username=username)
+            merge_extraction(
+                profile, sites[ref].extraction, username=owner_of(sites[ref], username)
+            )
     return profile
 
 

@@ -59,6 +59,10 @@ class AIProfileEvidenceRecord:
     scanned_at: str | None
     ai_extraction: str | None
     ai_extraction_contract_hash: str | None
+    # Which username the row belongs to. Only set by the person query: a
+    # username's own evidence is all one username, and leaving it None there
+    # keeps that path exactly as it was.
+    username: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +161,22 @@ class StoredUsernameListing:
     """
 
     username: str
+    total_sites: int
+    claimed_sites: int
+    last_scanned_at: str | None
+    has_profile: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPersonListing:
+    """One person: a named group of stored usernames, for the picker.
+
+    The counts are sums over the linked usernames' results. `usernames` is in
+    link order so the list draws the same way every time it loads.
+    """
+
+    name: str
+    usernames: tuple[str, ...]
     total_sites: int
     claimed_sites: int
     last_scanned_at: str | None
@@ -369,6 +389,35 @@ class SherlockDB:
             )
         """)
 
+        # People: a named group of usernames that one human is believed to use,
+        # with one pass-two profile built across all of them. Linked by hand;
+        # nothing here infers a link.
+        #
+        # UNIQUE(username_id) because a username belongs to AT MOST ONE person.
+        # Letting it sit in two would let one account's facts count as evidence
+        # for two different people, which is exactly the kind of quiet wrong
+        # answer this tool exists not to give.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS people (
+                id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                profile_summary TEXT,
+                profile_summary_input_hash TEXT,
+                profile_summary_updated_at TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS person_usernames (
+                person_id INTEGER NOT NULL,
+                username_id INTEGER NOT NULL UNIQUE,
+                linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (person_id, username_id),
+                FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE,
+                FOREIGN KEY (username_id) REFERENCES usernames(id) ON DELETE CASCADE
+            )
+        """)
+
         await self._ensure_column(
             table_name="usernames",
             column_name="profile_summary_input_hash",
@@ -477,6 +526,8 @@ class SherlockDB:
 
         async with self._write_lock:
             try:
+                await db.execute("DELETE FROM person_usernames")
+                await db.execute("DELETE FROM people")
                 await db.execute("DELETE FROM results")
                 await db.execute("DELETE FROM usernames")
                 await db.commit()
@@ -794,19 +845,12 @@ class SherlockDB:
                     if cur.rowcount == 0:
                         raise RuntimeError(f"Failed to update AI extraction for site id {site_id!r}")
 
-                await db.execute(
-                    """
-                    UPDATE usernames
-                    SET
-                        profile_summary_input_hash = NULL
-                    WHERE id = (
-                        SELECT username_id
-                        FROM results
-                        WHERE id = ?
-                    )
-                    """,
-                    (site_id,),
-                )
+                async with db.execute(
+                    "SELECT username_id FROM results WHERE id = ?", (site_id,)
+                ) as cur:
+                    owner = await cur.fetchone()
+                if owner is not None:
+                    await self._invalidate_profile_summary(int(owner["username_id"]))
                 await db.commit()
 
             except BaseException:
@@ -1058,6 +1102,21 @@ class SherlockDB:
             """,
             (username_id,),
         )
+        # And the profile of the person this username is part of, if any: that
+        # profile was built from the same extraction. The input hash would catch
+        # the change on its own; clearing it here keeps "a write that touches an
+        # extraction invalidates every profile built from it" a database rule
+        # rather than something a caller has to remember.
+        await db.execute(
+            """
+            UPDATE people
+            SET profile_summary_input_hash = NULL
+            WHERE id = (
+                SELECT person_id FROM person_usernames WHERE username_id = ?
+            )
+            """,
+            (username_id,),
+        )
 
     async def get_username_by_id(self, username_id: int) -> str | None:
         db = self._require_db()
@@ -1180,6 +1239,12 @@ class SherlockDB:
             counted = await cur.fetchone()
         removed = int(counted["n"]) if counted is not None else 0
 
+        # The person loses this username's evidence, so its profile is stale;
+        # then the link goes, so a person never points at a deleted username.
+        await self._invalidate_profile_summary(username_id)
+        await db.execute(
+            "DELETE FROM person_usernames WHERE username_id = ?", (username_id,)
+        )
         await db.execute("DELETE FROM results WHERE username_id = ?", (username_id,))
         await db.execute("DELETE FROM usernames WHERE id = ?", (username_id,))
         await db.commit()
@@ -1301,3 +1366,427 @@ class SherlockDB:
             rows = await cur.fetchall()
 
         return {row["site_name"]: dict(row) for row in rows}
+
+    # ------------------------------------------------------------------
+    # People
+    #
+    # A person groups usernames that one human is believed to use, and owns one
+    # pass-two profile built across all of them. Every write here is explicit
+    # and named; nothing links usernames on its own. Deleting a person removes
+    # the group and its profile and NEVER the usernames or their results --
+    # the opposite of `delete_username`, which is why the two are separate
+    # methods with separate confirmations.
+    # ------------------------------------------------------------------
+
+    async def _person_id(self, name: str) -> int | None:
+        db = self._require_db()
+        async with db.execute("SELECT id FROM people WHERE name = ?", (name,)) as cur:
+            row = await cur.fetchone()
+        return int(row["id"]) if row is not None else None
+
+    async def _username_id(self, username: str) -> int | None:
+        db = self._require_db()
+        async with db.execute(
+            "SELECT id FROM usernames WHERE username = ?", (username,)
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["id"]) if row is not None else None
+
+    async def _invalidate_person(self, person_id: int) -> None:
+        db = self._require_db()
+        await db.execute(
+            "UPDATE people SET profile_summary_input_hash = NULL WHERE id = ?",
+            (person_id,),
+        )
+
+    async def create_person(self, name: str) -> None:
+        """Create an empty person. Raises `PersonError` if the name is taken."""
+        name = _person_name(name)
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                if await self._person_id(name) is not None:
+                    raise PersonError(f"a person called {name!r} already exists")
+                await db.execute("INSERT INTO people (name) VALUES (?)", (name,))
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def rename_person(self, old: str, new: str) -> None:
+        new = _person_name(new)
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                person_id = await self._person_id(old)
+                if person_id is None:
+                    raise PersonError(f"no person called {old!r}")
+                if new != old and await self._person_id(new) is not None:
+                    raise PersonError(f"a person called {new!r} already exists")
+                await db.execute(
+                    "UPDATE people SET name = ? WHERE id = ?", (new, person_id)
+                )
+                # The stored profile carries the name it was built under, and the
+                # name is part of its input hash, so a rename makes it stale.
+                await self._invalidate_person(person_id)
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def delete_person(self, name: str) -> list[str]:
+        """Remove a person and its profile. Returns the usernames it held.
+
+        The usernames and every result stored for them are kept. That is the
+        promise the confirmation makes, and the return value is what it names.
+        """
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                person_id = await self._person_id(name)
+                if person_id is None:
+                    return []
+                usernames = await self._person_usernames(person_id)
+                await db.execute(
+                    "DELETE FROM person_usernames WHERE person_id = ?", (person_id,)
+                )
+                await db.execute("DELETE FROM people WHERE id = ?", (person_id,))
+                await db.commit()
+                return usernames
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def link_username(self, name: str, username: str) -> None:
+        """Add a stored username to a person.
+
+        Refused, rather than silently moved, when the username already belongs
+        to a different person: moving it changes what two profiles say, and the
+        caller should have to ask for that by unlinking first.
+        """
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                person_id = await self._person_id(name)
+                if person_id is None:
+                    raise PersonError(f"no person called {name!r}")
+                username_id = await self._username_id(username)
+                if username_id is None:
+                    raise PersonError(f"nothing is stored for {username!r}")
+                async with db.execute(
+                    """
+                    SELECT p.id, p.name
+                    FROM person_usernames pu
+                    JOIN people p ON p.id = pu.person_id
+                    WHERE pu.username_id = ?
+                    """,
+                    (username_id,),
+                ) as cur:
+                    owner = await cur.fetchone()
+                if owner is not None:
+                    if int(owner["id"]) == person_id:
+                        return
+                    raise PersonError(
+                        f"{username!r} already belongs to {owner['name']!r}; "
+                        "remove it from there first"
+                    )
+                await db.execute(
+                    "INSERT INTO person_usernames (person_id, username_id) VALUES (?, ?)",
+                    (person_id, username_id),
+                )
+                await self._invalidate_person(person_id)
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def unlink_username(self, name: str, username: str) -> bool:
+        """Remove a username from a person. Returns whether a link was removed."""
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                person_id = await self._person_id(name)
+                username_id = await self._username_id(username)
+                if person_id is None or username_id is None:
+                    return False
+                async with db.execute(
+                    "DELETE FROM person_usernames WHERE person_id = ? AND username_id = ?",
+                    (person_id, username_id),
+                ) as cur:
+                    removed = cur.rowcount > 0
+                if removed:
+                    await self._invalidate_person(person_id)
+                await db.commit()
+                return removed
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def _person_usernames(self, person_id: int) -> list[str]:
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT u.username
+            FROM person_usernames pu
+            JOIN usernames u ON u.id = pu.username_id
+            WHERE pu.person_id = ?
+            ORDER BY pu.linked_at, u.username
+            """,
+            (person_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [str(row["username"]) for row in rows]
+
+    async def get_person_usernames(self, name: str) -> list[str] | None:
+        """The usernames linked to a person, or None if there is no such person."""
+        person_id = await self._person_id(name)
+        if person_id is None:
+            return None
+        return await self._person_usernames(person_id)
+
+    async def get_person_of(self, username: str) -> str | None:
+        """The person a username belongs to, if any."""
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT p.name
+            FROM person_usernames pu
+            JOIN people p ON p.id = pu.person_id
+            JOIN usernames u ON u.id = pu.username_id
+            WHERE u.username = ?
+            """,
+            (username,),
+        ) as cur:
+            row = await cur.fetchone()
+        return str(row["name"]) if row is not None else None
+
+    async def list_people(self) -> list[StoredPersonListing]:
+        """Every person, most recently scanned first, people with no scans last."""
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT
+                p.id AS id,
+                p.name AS name,
+                p.profile_summary IS NOT NULL AS has_profile,
+                COUNT(r.id) AS total_sites,
+                SUM(CASE WHEN r.status = ? THEN 1 ELSE 0 END) AS claimed_sites,
+                MAX(r.scanned_at) AS last_scanned_at
+            FROM people p
+            LEFT JOIN person_usernames pu ON pu.person_id = p.id
+            LEFT JOIN results r ON r.username_id = pu.username_id
+            GROUP BY p.id, p.name, p.profile_summary
+            ORDER BY MAX(r.scanned_at) IS NULL, MAX(r.scanned_at) DESC, p.name ASC
+            """,
+            (str(QueryStatus.CLAIMED),),
+        ) as cur:
+            rows = await cur.fetchall()
+        listings = []
+        for row in rows:
+            listings.append(
+                StoredPersonListing(
+                    name=str(row["name"]),
+                    usernames=tuple(await self._person_usernames(int(row["id"]))),
+                    total_sites=int(row["total_sites"] or 0),
+                    claimed_sites=int(row["claimed_sites"] or 0),
+                    last_scanned_at=row["last_scanned_at"],
+                    has_profile=bool(row["has_profile"]),
+                )
+            )
+        return listings
+
+    async def get_person_profile_evidence(
+        self,
+        name: str,
+    ) -> list[AIProfileEvidenceRecord]:
+        """Pass 2 input for a person: every linked username's claimed pages.
+
+        The same rows `get_ai_profile_evidence` returns for each username, with
+        the username attached. `results.id` is unique across usernames, so the
+        site id stays a valid key for provenance.
+        """
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT
+                r.id,
+                r.site_name,
+                r.site_url,
+                r.scanned_at,
+                r.ai_extraction,
+                r.ai_extraction_contract_hash,
+                u.username
+            FROM people p
+            JOIN person_usernames pu ON pu.person_id = p.id
+            JOIN usernames u ON u.id = pu.username_id
+            JOIN results r ON r.username_id = u.id
+            WHERE p.name = ?
+                AND r.status = ?
+                AND NULLIF(TRIM(r.response_text), '') IS NOT NULL
+            ORDER BY r.id
+            """,
+            (name, str(QueryStatus.CLAIMED)),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        def text(row: Any, column: str) -> str | None:
+            value = row[column]
+            return str(value) if value is not None else None
+
+        return [
+            AIProfileEvidenceRecord(
+                site_id=int(row["id"]),
+                site_name=str(row["site_name"]),
+                site_url=text(row, "site_url"),
+                scanned_at=text(row, "scanned_at"),
+                ai_extraction=text(row, "ai_extraction"),
+                ai_extraction_contract_hash=text(row, "ai_extraction_contract_hash"),
+                username=str(row["username"]),
+            )
+            for row in rows
+        ]
+
+    async def get_person_profile_cache(self, name: str) -> ProfileSummaryCache | None:
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT profile_summary, profile_summary_input_hash, profile_summary_updated_at
+            FROM people
+            WHERE name = ?
+            """,
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return ProfileSummaryCache(
+            profile_summary=(
+                str(row["profile_summary"]) if row["profile_summary"] is not None else None
+            ),
+            input_hash=(
+                str(row["profile_summary_input_hash"])
+                if row["profile_summary_input_hash"] is not None
+                else None
+            ),
+            updated_at=(
+                str(row["profile_summary_updated_at"])
+                if row["profile_summary_updated_at"] is not None
+                else None
+            ),
+        )
+
+    async def update_person_profile_summary(
+        self,
+        name: str,
+        profile_summary: str,
+        input_hash: str | None = None,
+    ) -> None:
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                async with db.execute(
+                    """
+                    UPDATE people
+                    SET
+                        profile_summary = ?,
+                        profile_summary_input_hash = ?,
+                        profile_summary_updated_at = CURRENT_TIMESTAMP
+                    WHERE name = ?
+                    """,
+                    (profile_summary, input_hash, name),
+                ) as cur:
+                    if cur.rowcount == 0:
+                        raise PersonError(f"no person called {name!r}")
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def invalidate_person_profile_summary(self, name: str) -> None:
+        db = self._require_db()
+        async with self._write_lock:
+            try:
+                await db.execute(
+                    "UPDATE people SET profile_summary_input_hash = NULL WHERE name = ?",
+                    (name,),
+                )
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+
+
+    async def get_person_map(self) -> dict[str, str]:
+        """Username -> the person it is linked to, for every linked username."""
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT u.username, p.name
+            FROM person_usernames pu
+            JOIN people p ON p.id = pu.person_id
+            JOIN usernames u ON u.id = pu.username_id
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+        return {str(row["username"]): str(row["name"]) for row in rows}
+
+    async def get_all_site_extractions(self) -> dict[str, list[SiteExtractionRecord]]:
+        """Every username's claimed sites with their extractions, in one read.
+
+        The input to link suggestions, which compare every username against
+        every other and so need them all at once. Same rows as
+        `get_site_extractions`, without its per-username round trip.
+        """
+        db = self._require_db()
+        async with db.execute(
+            """
+            SELECT
+                u.username,
+                r.id,
+                r.site_name,
+                r.site_url,
+                r.scanned_at,
+                r.ai_extraction,
+                r.ai_extraction_contract_hash,
+                r.ai_extraction_model,
+                r.ai_extraction_reasoning
+            FROM results r
+            JOIN usernames u ON u.id = r.username_id
+            WHERE r.status = ?
+            ORDER BY u.username, r.site_name COLLATE NOCASE
+            """,
+            (str(QueryStatus.CLAIMED),),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        def text(row: Any, column: str) -> str | None:
+            value = row[column]
+            return str(value) if value is not None else None
+
+        grouped: dict[str, list[SiteExtractionRecord]] = {}
+        for row in rows:
+            grouped.setdefault(str(row["username"]), []).append(
+                SiteExtractionRecord(
+                    site_id=int(row["id"]),
+                    site_name=str(row["site_name"]),
+                    site_url=text(row, "site_url"),
+                    scanned_at=text(row, "scanned_at"),
+                    ai_extraction=text(row, "ai_extraction"),
+                    ai_extraction_contract_hash=text(row, "ai_extraction_contract_hash"),
+                    ai_extraction_model=text(row, "ai_extraction_model"),
+                    ai_extraction_reasoning=text(row, "ai_extraction_reasoning"),
+                )
+            )
+        return grouped
+
+class PersonError(ValueError):
+    """A person operation that cannot be done as asked: the message says why."""
+
+
+def _person_name(name: str) -> str:
+    cleaned = " ".join(name.split())
+    if not cleaned:
+        raise PersonError("a person needs a name")
+    if len(cleaned) > 80:
+        raise PersonError("a person's name can be at most 80 characters")
+    return cleaned
