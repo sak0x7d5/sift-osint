@@ -76,7 +76,10 @@ from sherlock_project.settings import resolve_runtime_settings
 from sherlock_project.settings_tui import run_settings
 from sherlock_project.show import run_show
 from sherlock_project.sites import SitesInformation
-from sherlock_project.synthesis_pipeline import synthesize_username_profile
+from sherlock_project.synthesis_pipeline import (
+    synthesize_person_profile,
+    synthesize_username_profile,
+)
 from sherlock_project.wmn_adapter import normalize_username, preferred_transport
 
 # Markers live in the initial HTML, and waiting for full 'load' costs sites that
@@ -476,6 +479,41 @@ async def synthesize_profiles(
     return failures
 
 
+async def synthesize_people(
+    *,
+    db: SherlockDB,
+    ai_service: AIService,
+    people: Sequence[str],
+    force: bool,
+    inline_anchors: Sequence[IdentityAnchor] = (),
+    reporter: TerminalReporter | None = None,
+) -> dict[str, Exception]:
+    """`synthesize_profiles` for people: one profile per person, failures by name."""
+    context = build_investigation_context(inline_anchors)
+    failures: dict[str, Exception] = {}
+    for person in people:
+        if reporter is not None:
+            reporter.synthesis_started(person)
+        try:
+            result = await synthesize_person_profile(
+                db=db,
+                ai_service=ai_service,
+                person=person,
+                context=context,
+                force=force,
+            )
+        except Exception as error:
+            failures[person] = error
+            if reporter is not None:
+                reporter.synthesis_failed(person, error)
+            continue
+        if reporter is not None:
+            reporter.synthesis_finished(
+                person, result.profile, cache_hit=result.cache_hit
+            )
+    return failures
+
+
 async def report_cached_ai_evidence(
     *,
     db: SherlockDB,
@@ -505,8 +543,14 @@ async def run_synthesis_only(
     reporter: TerminalReporter | None = None,
     ai_settings: AISettings | None = None,
     analyse_pending: bool = False,
+    people: Sequence[str] = (),
 ) -> dict[str, Exception]:
     """Rebuild pass two from stored evidence. Returns the usernames that failed.
+
+    `people` builds PERSON profiles as well, after the usernames: each over
+    every username linked to it, with that username set's unread pages
+    analysed first when `analyse_pending` is on. Failures are keyed by the
+    person's name.
 
     Fetches nothing: pass two merges extractions already on disk. An
     UNANCHORED run needs no model at all -- the merge is deterministic and
@@ -530,16 +574,23 @@ async def run_synthesis_only(
     interrupted = False
     failures: dict[str, Exception] = {}
     try:
+        # Every username whose pages this build reads: the ones asked for, and
+        # every one linked to a person being built.
+        evidence_usernames = list(usernames)
+        for person in people:
+            for linked in await db.get_person_usernames(person) or []:
+                if linked not in evidence_usernames:
+                    evidence_usernames.append(linked)
         await report_cached_ai_evidence(
             db=db,
-            usernames=usernames,
+            usernames=evidence_usernames,
             contract_hash=contract_hash,
             reporter=reporter,
         )
         anchored = build_investigation_context(inline_anchors).has_anchors
         pending_ids: list[int] = []
         if analyse_pending:
-            for username in usernames:
+            for username in evidence_usernames:
                 pending_ids.extend(
                     await db.get_pending_ai_extraction_ids(
                         username, contract_hash=contract_hash
@@ -594,6 +645,17 @@ async def run_synthesis_only(
             inline_anchors=inline_anchors,
             reporter=reporter,
         )
+        if people:
+            failures.update(
+                await synthesize_people(
+                    db=db,
+                    ai_service=ai_service,
+                    people=people,
+                    force=force,
+                    inline_anchors=inline_anchors,
+                    reporter=reporter,
+                )
+            )
     except asyncio.CancelledError:
         interrupted = True
         raise
@@ -1452,6 +1514,12 @@ async def main() -> int:
         from sherlock_project.tui import run_ui
 
         return await run_ui(sys.argv[2:])
+    # Fifth reserved word, the same trade again: a username literally called
+    # "person" cannot be scanned as a bare argument.
+    if len(sys.argv) >= 2 and sys.argv[1] == "person":
+        from sherlock_project.person_cli import run_person
+
+        return await run_person(sys.argv[2:])
     parser = ArgumentParser(
         formatter_class=RawDescriptionHelpFormatter,
         description=f"{__longname__} (Version {__version__})",
@@ -1475,6 +1543,10 @@ async def main() -> int:
             "scan, results and\n"
             "                            settings in one place. Needs a "
             "terminal.\n"
+            "  sherlock-rm person ...       Group usernames that belong to one "
+            "person and build\n"
+            "                            one profile across them. See\n"
+            "                            `sherlock-rm person --help`.\n"
         ),
     )
     parser.add_argument(
