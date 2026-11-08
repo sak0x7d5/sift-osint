@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 
 AnchorTrust = Literal["verified", "strong", "context"]
 ProfileMode = Literal["aggregate", "anchored"]
@@ -24,6 +32,25 @@ SourceDisposition = Literal[
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+# Fields that exist only for PERSON profiles. They are left out of a dump while
+# unset, so a username profile serialises to exactly the JSON it did before
+# people existed: what is stored, exported and compared stays the same shape.
+_PERSON_ONLY_FIELDS = ("person", "usernames", "username")
+
+
+def _drop_unset_person_fields(
+    model: BaseModel, handler: SerializerFunctionWrapHandler
+) -> dict[str, Any]:
+    data = handler(model)
+    for name in _PERSON_ONLY_FIELDS:
+        if name in type(model).model_fields and name in data and data[name] in (None, []):
+            # `username` is required on ProfileSynthesis and always set, so it
+            # never matches; on SourceDecision and SiteExtraction it is the
+            # optional per-page handle.
+            del data[name]
+    return data
 
 
 class IdentityAnchor(StrictModel):
@@ -59,6 +86,17 @@ class SiteExtraction(StrictModel):
     site_url: str | None = None
     scanned_at: str | None = None
     extraction: dict[str, Any]
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        return _drop_unset_person_fields(self, handler)
+
+    # The username this page was found under. Set only for a PERSON profile,
+    # where the pages come from several usernames: each page's own handle is
+    # what gets filtered out of its facts, and every other linked handle is
+    # kept, because "alice_dev's GitHub says she is also alice" is evidence.
+    # None for a username profile, which filters by the searched username.
+    username: str | None = None
 
 
 class InvalidExtraction(StrictModel):
@@ -106,6 +144,13 @@ class SourceDecision(StrictModel):
     site_url: str | None = None
     disposition: SourceDisposition
     identity_status: IdentityStatus | None = None
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        return _drop_unset_person_fields(self, handler)
+
+    # Which username the site was found under; person profiles only. Without
+    # it "GitHub" names two different accounts and provenance cannot say which.
+    username: str | None = None
 
 
 class ProfileSynthesis(StrictModel):
@@ -126,6 +171,17 @@ class ProfileSynthesis(StrictModel):
     source_decisions: list[SourceDecision] = Field(default_factory=list)
     anchors: list[IdentityAnchor] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # Set when this profile belongs to a PERSON -- a group of usernames --
+    # rather than to one username. `username` then holds the person's name, so
+    # every renderer that titles a profile by it keeps working, and
+    # `usernames` lists the handles it was built from. Both optional, so every
+    # profile stored before people existed still validates unchanged.
+    person: str | None = None
+    usernames: list[str] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        return _drop_unset_person_fields(self, handler)
 
 
 @dataclass(slots=True)
@@ -280,6 +336,23 @@ def is_username_variant(value: Any, username: str) -> bool:
     norm_val = value.strip().lstrip("@").replace(" ", "").casefold()
     norm_user = username.strip().lstrip("@").replace(" ", "").casefold()
     return norm_val == norm_user
+
+
+def owner_of(extraction: SiteExtraction, username: str) -> str:
+    """The handle to filter out of this page's facts.
+
+    The page's own username when it has one (a person profile), otherwise the
+    searched username. NEVER the person's name: a person called "Alice Smith"
+    used as a username filter would drop the full name "Alice Smith" from
+    every page, which is the one fact most likely to be right.
+    """
+    return extraction.username if extraction.username is not None else username
+
+
+def searched_handles(username: str, extractions: Iterable[SiteExtraction]) -> list[str]:
+    """Every handle the pages were found under: one for a username profile."""
+    owners = sorted({e.username for e in extractions if e.username is not None})
+    return owners or [username]
 
 
 def merge_extraction(
@@ -443,7 +516,11 @@ def aggregate_synthesis(
                 )
             )
             continue
-        merge_extraction(strong_profile, extraction.extraction, username=username)
+        merge_extraction(
+            strong_profile,
+            extraction.extraction,
+            username=owner_of(extraction, username),
+        )
         decisions.append(
             SourceDecision(
                 site_id=extraction.site_id,
@@ -487,7 +564,8 @@ def compute_synthesis_input_hash(
     prompt_fingerprints: dict[str, str],
 ) -> str:
     anchored = context.has_anchors
-    payload = {
+    person = any(extraction.username is not None for extraction in evidence.extractions)
+    payload: dict[str, Any] = {
         "schema_version": 8,
         "username": username,
         "mode": "anchored" if anchored else "aggregate",
@@ -500,6 +578,14 @@ def compute_synthesis_input_hash(
                     "site_name": extraction.site_name,
                     "site_url": extraction.site_url,
                     "extraction": extraction.extraction,
+                    # Only for a person. A username profile's payload has to
+                    # stay byte-for-byte what it was, or every cached profile
+                    # on disk would be rebuilt for no change in its input.
+                    **(
+                        {"username": extraction.username}
+                        if extraction.username is not None
+                        else {}
+                    ),
                 }
                 for extraction in sorted(
                     evidence.extractions,
@@ -521,6 +607,8 @@ def compute_synthesis_input_hash(
         },
         "prompts": prompt_fingerprints if anchored else {},
     }
+    if person:
+        payload["person"] = True
     serialized = json.dumps(
         payload,
         ensure_ascii=False,

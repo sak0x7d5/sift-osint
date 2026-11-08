@@ -55,6 +55,8 @@ from sherlock_project.profile_synthesis import (
     canonical_field,
     merge_extraction,
     normalize_value,
+    owner_of,
+    searched_handles,
     synthesis_warnings,
 )
 
@@ -948,27 +950,22 @@ def _assemble_anchored_profile(
             merge_extraction(
                 final_strong_profile,
                 extraction.extraction,
-                username=username,
+                username=owner_of(extraction, username),
             )
         elif decision.identity_status == "unsure":
             merge_extraction(
                 final_unsure_profile,
                 extraction.extraction,
-                username=username,
+                username=owner_of(extraction, username),
             )
 
     source_decisions = [decisions[site_id] for site_id in sorted(decisions)]
+    # No username filter here: both inputs were filtered page by page above,
+    # and for a person `username` is the person's NAME, which must never be
+    # used as a filter (it would drop a full name equal to it).
     visible_profile: dict[str, Any] = {}
-    merge_extraction(
-        visible_profile,
-        final_strong_profile,
-        username=username,
-    )
-    merge_extraction(
-        visible_profile,
-        final_unsure_profile,
-        username=username,
-    )
+    merge_extraction(visible_profile, final_strong_profile)
+    merge_extraction(visible_profile, final_unsure_profile)
     included_extractions = [
         extractions_by_site_id[decision.site_id]
         for decision in source_decisions
@@ -1254,7 +1251,7 @@ class AIService:
 
             try:
                 decision = await self._assess_target(
-                    username=username,
+                    username=owner_of(extraction, username),
                     context=context,
                     strong_profile=strong_profile,
                     extraction=extraction,
@@ -1293,7 +1290,11 @@ class AIService:
 
             if decision.identity_status == "strong_match":
                 disposition = "included"
-                merge_extraction(strong_profile, extraction.extraction, username=username)
+                merge_extraction(
+                    strong_profile,
+                    extraction.extraction,
+                    username=owner_of(extraction, username),
+                )
             elif decision.identity_status == "unsure":
                 disposition = "included"
                 unsure_extractions.append(extraction)
@@ -1314,7 +1315,7 @@ class AIService:
                 break
             try:
                 decision = await self._assess_target(
-                    username=username,
+                    username=owner_of(extraction, username),
                     context=context,
                     strong_profile=strong_profile,
                     extraction=extraction,
@@ -1323,7 +1324,11 @@ class AIService:
                 continue
 
             if decision.identity_status == "strong_match":
-                merge_extraction(strong_profile, extraction.extraction, username=username)
+                merge_extraction(
+                    strong_profile,
+                    extraction.extraction,
+                    username=owner_of(extraction, username),
+                )
                 decisions[extraction.site_id].identity_status = "strong_match"
             elif decision.identity_status == "reject":
                 decisions[extraction.site_id].disposition = "excluded"
@@ -1471,7 +1476,14 @@ class AIService:
         fails costs its own sites, not the round; a provider-wide error is
         re-raised for the caller to stop on.
         """
-        base: dict[str, object] = {"username": username, "anchors": anchors}
+        # For a person the pages were found under several handles, and the
+        # prompt's rule -- the handle is discovery context, never identity
+        # evidence -- applies to every one of them, so they are all sent.
+        handles = searched_handles(username, sites.values())
+        base: dict[str, object] = {
+            "username": handles[0] if len(handles) == 1 else handles,
+            "anchors": anchors,
+        }
         if strong_profile:
             base["strong_profile"] = strong_profile
         base_bytes = len(json.dumps(base, ensure_ascii=False).encode("utf-8"))
