@@ -1237,6 +1237,19 @@ ModalScreen { align: center middle; }
 #anchor-buttons { height: auto; margin: 1 0 0 0; }
 #anchor-buttons .spacer { width: 1fr; height: 1; }
 
+/* ---- people dialogs -------------------------------------------------- */
+
+#choice-blurb, #name-blurb { height: auto; padding: 1 0; }
+/* Capped, so twenty people or forty suggestions scroll inside the dialog
+   instead of pushing its buttons off the bottom of the screen. */
+#choice-list { height: auto; max-height: 16; margin: 0 0 1 0; }
+#suggestion-list { height: auto; max-height: 20; margin: 0 0 1 0; }
+/* A suggestion is several lines -- the pair, then its reasons -- so each one
+   gets air under it, or the reasons of one read as the heading of the next. */
+#suggestion-list > .option-list--option { padding: 0 0 1 0; }
+#name-input { margin: 0 0 0 0; }
+#name-status { height: auto; padding: 0 0 1 1; }
+
 /* ---- record actions menu --------------------------------------------- */
 
 /* A popup at the top right, under the chip that opens it, not a centred

@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import asyncio
 import webbrowser
+from dataclasses import replace
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -144,11 +145,14 @@ SECTION_FOR_TAB = {
 NO_EVIDENCE = "-no-evidence"
 
 from sherlock_project.database import (
+    PersonError,
     SherlockDB,
     SiteExtractionRecord,
+    StoredPersonListing,
     StoredUsernameListing,
     default_database_path,
 )
+from sherlock_project.person_links import LinkSuggestion, load_link_suggestions
 from sherlock_project.profile_synthesis import IdentityAnchor
 from sherlock_project.result import QueryStatus
 from sherlock_project.tui.anchor_screen import AnchorScreen, anchor_label
@@ -159,6 +163,14 @@ from sherlock_project.tui.extraction_view import (
     extraction_summary,
     facts_cell,
     sort_extractions,
+)
+from sherlock_project.tui.person_screen import (
+    NEW_PERSON,
+    PERSON_MARK,
+    ChoiceScreen,
+    LinkSuggestionsScreen,
+    NameScreen,
+    person_picker,
 )
 from sherlock_project.tui.reporter import TuiReporter
 from sherlock_project.tui.theme import (
@@ -207,6 +219,24 @@ KEY_MIN_DETAIL_WIDTH = 46
 # picker over the detail (ctrl+l). At 80 columns the 37-cell list took almost
 # half the screen and left the record a link column three characters wide.
 NARROW_WIDTH = 100
+
+# Row keys in the list that are not usernames. A person's row is its name behind
+# a prefix no username can start with, so a person and a username that share a
+# name ("alice" the person, "alice" the handle) are still two rows.
+PERSON_KEY_PREFIX = "\x00person:"
+SUGGESTIONS_KEY = "\x00suggestions"
+
+
+def person_key(name: str) -> str:
+    return f"{PERSON_KEY_PREFIX}{name}"
+
+
+def person_of_key(key: str | None) -> str | None:
+    """The person a row key names, or None for a username row."""
+    if key is not None and key.startswith(PERSON_KEY_PREFIX):
+        return key[len(PERSON_KEY_PREFIX):]
+    return None
+
 
 def profile_has_facts(profile: Any) -> bool:
     """Whether a stored profile says anything about anyone."""
@@ -310,6 +340,12 @@ class ResultsPane(Vertical):
         Binding("alt+right,ctrl+right", "next_section", "section"),
         Binding("alt+left,ctrl+left", "prev_section", "prev section", show=False),
         Binding("m", "record_actions", "actions"),
+        # People. `n` adds the open username to a person, `p` opens the person
+        # it belongs to, `g` opens the suggested links. Each is also a row in
+        # the actions menu, which names the key.
+        Binding("n", "add_to_person", "add to person", show=False),
+        Binding("p", "open_person", "person"),
+        Binding("g", "link_suggestions", "suggested links"),
         Binding("ctrl+l", "toggle_picker", "usernames"),
         Binding("ctrl+e", "export", "export", show=False),
         Binding("ctrl+r", "reload", "refresh", show=False),
@@ -319,6 +355,15 @@ class ResultsPane(Vertical):
     def __init__(self) -> None:
         super().__init__()
         self._listings: list[StoredUsernameListing] = []
+        # People, and which person each linked username belongs to. Loaded with
+        # the username list so the list can nest usernames under their person.
+        self._people: list[StoredPersonListing] = []
+        self._person_of: dict[str, str] = {}
+        # Links the stored evidence suggests, and the pairs someone dismissed
+        # this session. Dismissals are not saved: like anchors, they are a
+        # per-session convenience, and a pair dismissed in error comes back.
+        self._suggestions: list[LinkSuggestion] = []
+        self._dismissed: set[tuple[str, str]] = set()
         self._show_sources = False
         self._show_notes = False
         self._selected: str | None = None
@@ -630,6 +675,17 @@ class ResultsPane(Vertical):
             db = await SherlockDB.create(str(default_database_path()))
             try:
                 self._listings = await db.list_usernames()
+                self._people = await db.list_people()
+                self._person_of = await db.get_person_map()
+                # Reads only. A suggestion is a line in the list, never a link.
+                try:
+                    self._suggestions = await load_link_suggestions(
+                        db, dismissed=frozenset(self._dismissed)
+                    )
+                except Exception:
+                    # A suggestion is a convenience; failing to compute one must
+                    # not cost the list it would have been a line of.
+                    self._suggestions = []
             finally:
                 await db.close()
             self._fill_list()
@@ -639,11 +695,38 @@ class ResultsPane(Vertical):
                 self._load_again = False
                 self._request_load()
 
+    def _row_order(self) -> list[tuple[str, Any]]:
+        """Every row the list draws, in order: (key, what it is).
+
+        People first, each followed by its usernames indented under it, then
+        every username that belongs to nobody, then -- only when there are
+        any -- one line offering the suggested links. People lead because a
+        person is the more finished thing: it is a conclusion someone reached,
+        and the loose usernames are what is left to sort.
+        """
+        listed = {listing.username: listing for listing in self._listings}
+        rows: list[tuple[str, Any]] = []
+        for person in self._people:
+            rows.append((person_key(person.name), person))
+            members = [name for name in person.usernames if name in listed]
+            for index, name in enumerate(members):
+                last = index == len(members) - 1
+                rows.append((name, (listed[name], "└ " if last else "├ ")))
+        for listing in self._listings:
+            if listing.username not in self._person_of:
+                rows.append((listing.username, (listing, "")))
+        if self._suggestions:
+            rows.append((SUGGESTIONS_KEY, None))
+        return rows
+
     @_unless_torn_down
     def _fill_list(self) -> None:
         table = self.query_one("#username-list", DataTable)
         table.clear()
-        if not self._listings:
+        self.query_one(".pane-title", Static).update(
+            "PEOPLE & USERNAMES" if self._people else "STORED USERNAMES"
+        )
+        if not self._listings and not self._people:
             self._set_detail(
                 Text(
                     "Nothing scanned yet.\n\n"
@@ -652,17 +735,54 @@ class ResultsPane(Vertical):
                 )
             )
             return
-        for listing in self._listings:
+        rows = self._row_order()
+        for key, item in rows:
+            if key == SUGGESTIONS_KEY:
+                table.add_row(
+                    # Short enough for the 15-cell column; the dialog and the
+                    # footer key ("g suggested links") say the rest.
+                    Text(
+                        f"+ {len(self._suggestions)} suggested",
+                        style=tone("accent"),
+                        overflow="ellipsis",
+                        no_wrap=True,
+                    ),
+                    Text(""),
+                    Text(""),
+                    key=key,
+                )
+                continue
+            if isinstance(item, StoredPersonListing):
+                # Bold, with the mark, and the counts summed over its usernames:
+                # a person row is a heading for the rows under it.
+                label = Text(overflow="ellipsis", no_wrap=True)
+                label.append(f"{PERSON_MARK} ", style=tone("accent"))
+                label.append(item.name, style="bold")
+                table.add_row(
+                    label,
+                    Text(
+                        str(item.claimed_sites),
+                        style=tone("bold success") if item.claimed_sites else "dim",
+                    ),
+                    Text(str(item.total_sites), style="dim"),
+                    key=key,
+                )
+                continue
+            listing, branch = item
+            # Text(), because a username is user data and Rich reads markup
+            # in cells -- the same reason `show` wraps its own.
+            label = Text(overflow="ellipsis", no_wrap=True)
+            if branch:
+                label.append(branch, style="dim")
+            label.append(listing.username)
             table.add_row(
-                # Text(), because a username is user data and Rich reads markup
-                # in cells -- the same reason `show` wraps its own.
-                Text(listing.username, overflow="ellipsis", no_wrap=True),
+                label,
                 Text(
                     str(listing.claimed_sites),
                     style=tone("bold success") if listing.claimed_sites else "dim",
                 ),
                 Text(str(listing.total_sites), style="dim"),
-                key=listing.username,
+                key=key,
             )
         # Which row to open, in order of authority:
         #   1. one something asked for by name (the scan pane's "view results");
@@ -673,21 +793,30 @@ class ResultsPane(Vertical):
         # The third rule is the fix. This tab reloads on every visit, and it
         # used to land on row 0 each time, so checking the scan tab and coming
         # back lost your place in the list.
-        names = [listing.username for listing in self._listings]
+        #
+        # "The top" is the top USERNAME, not the top row: people sit above the
+        # usernames, and a person heading the list is not news.
+        keys = [key for key, _ in rows if key != SUGGESTIONS_KEY]
+        newest = self._listings[0].username if self._listings else None
         wanted = self._pending_selection
         self._pending_selection = None
-        top_changed = bool(names) and names[0] != self._last_top
-        self._last_top = names[0] if names else None
-        if wanted not in names:
-            wanted = names[0] if top_changed else self._selected
-        row = names.index(wanted) if wanted in names else 0
+        top_changed = newest is not None and newest != self._last_top
+        self._last_top = newest
+        if wanted not in keys:
+            wanted = newest if top_changed else self._selected
+        row = keys.index(wanted) if wanted in keys else 0
         table.move_cursor(row=row)
-        self._select(names[row])
+        self._select(keys[row])
 
     @on(DataTable.RowHighlighted, "#username-list")
     def _highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.row_key is not None and event.row_key.value:
-            self._select(str(event.row_key.value))
+            key = str(event.row_key.value)
+            if key == SUGGESTIONS_KEY:
+                # A line that opens a dialog, not a record: the detail keeps
+                # showing whatever was open, and Enter opens the suggestions.
+                return
+            self._select(key)
 
     def action_toggle_sources(self) -> None:
         """Swap the compact source summary for full URLs, and back.
@@ -768,6 +897,10 @@ class ResultsPane(Vertical):
         if self._selected is None:
             self.notify("Nothing selected to delete.", severity="warning")
             return
+        person = person_of_key(self._selected)
+        if person is not None:
+            self._confirm_delete_person(person)
+            return
         self._confirm_delete(self._selected)
 
     @on(Button.Pressed, "#record-actions")
@@ -787,6 +920,7 @@ class ResultsPane(Vertical):
         username = self._selected
         if username is None:
             return
+        person = person_of_key(username)
         found = [
             str(account["url"])
             for account in (self._record or {}).get("accounts") or []
@@ -803,11 +937,295 @@ class ResultsPane(Vertical):
                 self.notify(f"Copied {count_of(len(found), 'link')}.")
             elif choice == "profile":
                 self._show_section(TAB_PROFILE)
+            elif choice == "add_to_person":
+                self.action_add_to_person()
+            elif choice == "open_person":
+                self.action_open_person()
+            elif choice == "remove_from_person":
+                owner = self._person_of.get(username)
+                if owner is not None:
+                    self._unlink(owner, username)
+            elif choice == "add_username":
+                self._add_username_to(person or "")
+            elif choice == "rename_person":
+                self._rename_person(person or "")
             elif choice == "delete":
-                self._confirm_delete(username)
+                if person is not None:
+                    self._confirm_delete_person(person)
+                else:
+                    self._confirm_delete(username)
 
         self.app.push_screen(
-            RecordActionsScreen(username, links=len(found)), chosen
+            RecordActionsScreen(
+                person if person is not None else username,
+                links=len(found),
+                person=person is not None,
+                belongs_to=None if person is not None else self._person_of.get(username),
+            ),
+            chosen,
+        )
+
+    # -- people ---------------------------------------------------------------
+    #
+    # Every write here is one named action, and each reloads the list after so
+    # the nesting on the left always shows what is stored. None of them
+    # rebuilds a profile: linking changes what a build WOULD read, and the
+    # PROFILE card says so -- building stays a separate, visible step.
+
+    def action_add_to_person(self) -> None:
+        """`n`: add the open username to a person -- an existing one or a new one."""
+        username = self._selected
+        if username is None or person_of_key(username) is not None:
+            return
+        owner = self._person_of.get(username)
+        others = [person.name for person in self._people if person.name != owner]
+
+        def picked(choice: str | None) -> None:
+            if choice is None:
+                return
+            if choice == NEW_PERSON:
+                self._name_new_person(username)
+                return
+            self._link(choice, [username], move_from=owner)
+
+        self.app.push_screen(person_picker(username, others), picked)
+
+    def _name_new_person(self, *usernames: str) -> None:
+        def named(name: str | None) -> None:
+            if name:
+                self._create_person(name, list(usernames))
+
+        self.app.push_screen(
+            NameScreen(
+                "New person",
+                "Name the person these usernames belong to. Only you see it; "
+                "it is how the list and the profile title them.",
+                initial=usernames[0] if usernames else "",
+                confirm_label="Create",
+                taken=[person.name for person in self._people],
+            ),
+            named,
+        )
+
+    def _rename_person(self, person: str) -> None:
+        def named(name: str | None) -> None:
+            if name and name != person:
+                self._person_write("rename", person, name)
+
+        self.app.push_screen(
+            NameScreen(
+                f"Rename {person}",
+                "The stored profile keeps its facts; it is marked out of date "
+                "because it carries the name it was built under.",
+                initial=person,
+                taken=[p.name for p in self._people],
+            ),
+            named,
+        )
+
+    def _add_username_to(self, person: str) -> None:
+        """From a person: pick one of the usernames that belongs to nobody."""
+        loose = [
+            listing.username
+            for listing in self._listings
+            if listing.username not in self._person_of
+        ]
+        if not loose:
+            self.notify(
+                "Every stored username already belongs to a person.",
+                severity="warning",
+            )
+            return
+
+        def picked(choice: str | None) -> None:
+            if choice:
+                self._link(person, [choice])
+
+        self.app.push_screen(
+            ChoiceScreen(
+                f"Add a username to {person}",
+                "Usernames that belong to no one yet.",
+                [(name, name) for name in loose],
+            ),
+            picked,
+        )
+
+    def action_open_person(self) -> None:
+        """`p`: from a linked username, open the person it belongs to."""
+        owner = (self._record or {}).get("person_of")
+        if owner:
+            self._open_key(person_key(owner))
+
+    def _open_key(self, key: str) -> None:
+        table = self.query_one("#username-list", DataTable)
+        keys = [row_key for row_key, _ in self._row_order()]
+        if key in keys:
+            table.move_cursor(row=keys.index(key))
+        self._select(key)
+
+    def action_link_suggestions(self) -> None:
+        """`g`, or Enter on the suggestions line: review what the evidence links."""
+        if not self._suggestions:
+            self.notify("No links suggested by what is stored.")
+            return
+
+        def chosen(choice: tuple[str, LinkSuggestion] | None) -> None:
+            if choice is None:
+                return
+            verb, suggestion = choice
+            if verb == "dismiss":
+                self._dismissed.add(suggestion.pair)
+                self._suggestions = [
+                    item for item in self._suggestions if item.pair != suggestion.pair
+                ]
+                self._fill_list()
+                if self._suggestions:
+                    self.call_after_refresh(self.action_link_suggestions)
+                return
+            self._accept_suggestion(suggestion)
+
+        self.app.push_screen(LinkSuggestionsScreen(self._suggestions), chosen)
+
+    def _accept_suggestion(self, suggestion: LinkSuggestion) -> None:
+        """Link a suggested pair: into the person one of them has, or a new one."""
+        first, second = suggestion.pair
+        owner_first = self._person_of.get(first)
+        owner_second = self._person_of.get(second)
+        if owner_first and owner_second:
+            # Two people already. Not a link but a merge, which this does not do.
+            self.notify(
+                f"{first} and {second} belong to two different people.",
+                severity="warning",
+            )
+            return
+        if owner_first or owner_second:
+            owner = owner_first or owner_second
+            self._link(owner, [second if owner_first else first])
+            return
+        self._name_new_person(first, second)
+
+    @work(group="results-people")
+    async def _create_person(self, name: str, usernames: list[str]) -> None:
+        db = await SherlockDB.create(str(default_database_path()))
+        try:
+            await db.create_person(name)
+            for username in usernames:
+                previous = self._person_of.get(username)
+                if previous is not None:
+                    await db.unlink_username(previous, username)
+                await db.link_username(name, username)
+        except PersonError as error:
+            self.notify(str(error), severity="error")
+            return
+        finally:
+            await db.close()
+        self.notify(
+            f"Created {name} with {', '.join(usernames)}."
+            " Build its profile on PROFILE."
+        )
+        self.select_key(person_key(name))
+
+    @work(group="results-people")
+    async def _link(
+        self, person: str, usernames: list[str], *, move_from: str | None = None
+    ) -> None:
+        db = await SherlockDB.create(str(default_database_path()))
+        try:
+            for username in usernames:
+                if move_from is not None and move_from != person:
+                    await db.unlink_username(move_from, username)
+                await db.link_username(person, username)
+        except PersonError as error:
+            self.notify(str(error), severity="error")
+            return
+        finally:
+            await db.close()
+        moved = f" (moved from {move_from})" if move_from and move_from != person else ""
+        self.notify(f"Added {', '.join(usernames)} to {person}{moved}.")
+        self.select_key(self._selected or person_key(person))
+
+    @work(group="results-people")
+    async def _unlink(self, person: str, username: str) -> None:
+        db = await SherlockDB.create(str(default_database_path()))
+        try:
+            await db.unlink_username(person, username)
+        finally:
+            await db.close()
+        self.notify(f"Removed {username} from {person}. Its results are kept.")
+        self.select_key(username)
+
+    @work(group="results-people")
+    async def _person_write(self, verb: str, person: str, value: str = "") -> None:
+        db = await SherlockDB.create(str(default_database_path()))
+        try:
+            if verb == "rename":
+                await db.rename_person(person, value)
+                target = person_key(value)
+                message = f"Renamed {person} to {value}."
+            else:
+                kept = await db.delete_person(person)
+                target = kept[0] if kept else None
+                message = (
+                    f"Removed {person}. Kept {', '.join(kept)} and their results."
+                    if kept
+                    else f"Removed {person}."
+                )
+        except PersonError as error:
+            self.notify(str(error), severity="error")
+            return
+        finally:
+            await db.close()
+        self.notify(message)
+        if target is None:
+            self._selected = None
+            self._record = None
+            self.action_reload()
+        else:
+            self.select_key(target)
+
+    def select_key(self, key: str) -> None:
+        """Reload, then open the row with this key (a username or a person)."""
+        self._pending_selection = key
+        self._request_load()
+
+    def _confirm_delete_person(self, person: str) -> None:
+        """Ask before removing a person -- and say plainly what is KEPT.
+
+        The opposite of deleting a username, and the dialog leads with that:
+        a person is a grouping and a profile, and removing it leaves every
+        username and every scan result exactly where it was. Red all the same,
+        because the profile does go and building it again can take a model
+        minutes.
+        """
+        listing = next((item for item in self._people if item.name == person), None)
+        usernames = list(listing.usernames) if listing is not None else []
+        detail = Text()
+        detail.append("This removes the person and its combined profile.\n")
+        if usernames:
+            detail.append("\nKept: ", style="bold")
+            detail.append(
+                f"{', '.join(usernames)} and every scan result stored for "
+                f"{'it' if len(usernames) == 1 else 'them'}."
+            )
+        detail.append(
+            "\n\nThe profile cannot be recovered, but building it again from "
+            "the same usernames gives it back.",
+            style="dim",
+        )
+
+        def erase(confirmed: bool | None) -> None:
+            if confirmed:
+                self._person_write("delete", person)
+
+        self.app.push_screen(
+            ConfirmScreen(
+                f"Remove {person}?",
+                detail,
+                confirm_label="Remove",
+                cancel_label="Keep",
+                danger=True,
+            ),
+            erase,
         )
 
     class Rescan(Message):
@@ -907,16 +1325,29 @@ class ResultsPane(Vertical):
         # already decides what "unresolved" means and how a stored profile that
         # no longer validates is reported. Two answers to those questions is one
         # too many.
-        from sherlock_project.show import _collect
+        from sherlock_project.show import _collect, _collect_person, person_site_label
 
+        person = person_of_key(username)
         db = await SherlockDB.create(str(default_database_path()))
         try:
-            record = await _collect(db, username)
-            # On the same connection as the record it annotates. A second
-            # connection opened just for this would race schema init against the
-            # first on a fresh database -- the bug `_ensure_column` already had
-            # to be made idempotent for.
-            extractions = await db.get_site_extractions(username)
+            if person is not None:
+                record = await _collect_person(db, person)
+                # Every linked username's extractions, renamed the way the
+                # record's account rows are -- "GitHub (alice)" -- because that
+                # label is the key the SITES rows look them up by.
+                extractions = [
+                    replace(entry, site_name=person_site_label(entry.site_name, member))
+                    for member in record.get("usernames") or []
+                    for entry in await db.get_site_extractions(member)
+                ]
+            else:
+                record = await _collect(db, username)
+                # On the same connection as the record it annotates. A second
+                # connection opened just for this would race schema init
+                # against the first on a fresh database -- the bug
+                # `_ensure_column` already had to be made idempotent for.
+                extractions = await db.get_site_extractions(username)
+                record["person_of"] = await db.get_person_of(username)
         finally:
             await db.close()
         self._record = record
@@ -1100,6 +1531,12 @@ class ResultsPane(Vertical):
             return self._building
         if action in ("record_actions", "export", "delete_username"):
             return self._selected is not None
+        if action == "add_to_person":
+            return self._selected is not None and person_of_key(self._selected) is None
+        if action == "open_person":
+            return bool(record is not None and record.get("person_of"))
+        if action == "link_suggestions":
+            return bool(self._suggestions)
         if action in ("next_section", "prev_section"):
             return record is not None
         if action == "toggle_picker":
@@ -1176,8 +1613,11 @@ class ResultsPane(Vertical):
             self._focus_section()
 
     @on(DataTable.RowSelected, "#username-list")
-    def _picked(self) -> None:
+    def _picked(self, event: DataTable.RowSelected) -> None:
         """Enter on a username closes the picker onto it."""
+        if event.row_key is not None and event.row_key.value == SUGGESTIONS_KEY:
+            self.action_link_suggestions()
+            return
         if self.has_class("-picking"):
             self.remove_class("-picking")
             self._focus_section()
@@ -1229,6 +1669,22 @@ class ResultsPane(Vertical):
             return
 
         unresolved = record.get("unresolved") or []
+        if record.get("person") is not None and not record.get("usernames"):
+            # A person nobody has added a username to yet. Say what to do,
+            # with the key -- an empty table under a name explains nothing.
+            self._set_detail(
+                Group(
+                    self._person_name_line(record),
+                    Text(
+                        "No usernames linked yet. Open a username and press n "
+                        "to add it to this person, or m for this person's "
+                        "actions.",
+                        style="dim italic",
+                    ),
+                )
+            )
+            self.query_one("#record-actions", Button).display = True
+            return
         accounts = record["accounts"]
 
         self._redraw_header()
@@ -1257,21 +1713,7 @@ class ResultsPane(Vertical):
             return
         accounts = record.get("accounts") or []
         unresolved = record.get("unresolved") or []
-        name = Text(no_wrap=True, overflow="ellipsis")
-        if self._narrow:
-            # Narrow, the list is a picker, so the header is where you learn
-            # there is one and which entry you are on.
-            names = [listing.username for listing in self._listings]
-            position = (
-                f"  {names.index(record['username']) + 1} of {len(names)}"
-                if record["username"] in names
-                else ""
-            )
-            name.append("▾ ", style="dim")
-            name.append(str(record["username"]), style=tone("bold accent"))
-            name.append(f"{position} · ^l list", style="dim")
-        else:
-            name.append(str(record["username"]), style=tone("bold accent"))
+        name = self._person_name_line(record)
         facts = Text(no_wrap=True, overflow="ellipsis")
         facts.append(
             f"{len(accounts)} found", style=tone("success") if accounts else "dim"
@@ -1285,6 +1727,47 @@ class ResultsPane(Vertical):
             style="dim",
         )
         self.query_one("#detail-header", Static).update(Group(name, facts))
+
+    def _person_name_line(self, record: dict[str, Any]) -> Text:
+        """The header's first line: who this record is.
+
+        A person shows its mark and its usernames; a username that belongs to
+        a person says so, with the key that opens it -- that is how someone
+        reading one handle learns there is a combined profile to read.
+        """
+        name = Text(no_wrap=True, overflow="ellipsis")
+        if self._narrow:
+            # Narrow, the list is a picker, so the header is where you learn
+            # there is one and which entry you are on.
+            keys = [key for key, _ in self._row_order() if key != SUGGESTIONS_KEY]
+            position = (
+                f"  {keys.index(self._selected) + 1} of {len(keys)}"
+                if self._selected in keys
+                else ""
+            )
+            name.append("▾ ", style="dim")
+        else:
+            position = ""
+        person = record.get("person")
+        if person is not None:
+            name.append(f"{PERSON_MARK} ", style=tone("accent"))
+            name.append(str(person), style=tone("bold accent"))
+            members = record.get("usernames") or []
+            name.append(
+                f" · {count_of(len(members), 'username')}"
+                + (f": {', '.join(members)}" if members else ""),
+                style="dim",
+            )
+        else:
+            name.append(str(record["username"]), style=tone("bold accent"))
+            owner = record.get("person_of")
+            if owner:
+                name.append("  part of ", style="dim")
+                name.append(f"{PERSON_MARK} {owner}", style=tone("accent"))
+                name.append(" (p)", style="dim")
+        if self._narrow:
+            name.append(f"{position} · ^l list", style="dim")
+        return name
 
     def _fill_sites(
         self,
@@ -1617,7 +2100,9 @@ class ResultsPane(Vertical):
         Re-seeded only when the selected username changes, or edits made for one
         username would be silently thrown away by clicking back to it.
         """
-        username = str(record.get("username") or "")
+        # The row key, not the name: a person and a username can share a name,
+        # and one must not inherit the other's anchors.
+        username = self._selected or str(record.get("username") or "")
         if username == self._anchors_for:
             return
         self._anchors_for = username
@@ -1691,6 +2176,24 @@ class ResultsPane(Vertical):
             # for work that needs no network.
             actions.add_class(NO_EVIDENCE)
             actions.remove_class("-has-profile")
+            if record.get("person") is not None:
+                hint.update(
+                    Text.assemble(
+                        ("Nothing to build a profile from yet\n", "bold"),
+                        (
+                            (
+                                "None of the linked usernames' stored pages "
+                                "gave any facts. Open each username and scan "
+                                "it again with analysis on."
+                            ),
+                            "dim",
+                        ),
+                    )
+                )
+                build.display = False
+                anchors.display = False
+                return
+            build.display = True
             hint.update(
                 Text.assemble(
                     ("Nothing to build a profile from yet\n", "bold"),
@@ -1719,6 +2222,7 @@ class ResultsPane(Vertical):
 
         actions.remove_class(NO_EVIDENCE)
         actions.set_class(has_profile, "-has-profile")
+        build.display = True
         anchors.display = True
         count = len(self._build_anchors)
         anchors.label = f"Edit anchors ({count})…" if count else "+ Add anchor…"
@@ -1754,6 +2258,9 @@ class ResultsPane(Vertical):
 
         card = Text()
         card.append("No profile yet. ", style="bold")
+        members = record.get("usernames") or []
+        if record.get("person") is not None:
+            card.append(f"Merges the pages of {count_of(len(members), 'username')}. ")
         if evidence:
             card.append(
                 f"{count_of(evidence, 'site')} gave facts that are ready to "
@@ -1829,7 +2336,12 @@ class ResultsPane(Vertical):
                 else "every site merged · instant, no model needed\n"
             )
             card.append(
-                " " * 10 + "Without anchors it describes anyone using this name.",
+                " " * 10
+                + (
+                    "Without anchors, any one account may still be someone else."
+                    if record.get("person") is not None
+                    else "Without anchors it describes anyone using this name."
+                ),
                 style=tone("warning"),
             )
         card.rstrip()
@@ -1961,14 +2473,23 @@ class ResultsPane(Vertical):
         if record is None or not record.get("known"):
             return
         username = str(record["username"])
+        person = record.get("person")
 
         if not self._extraction_count(record) and not record.get(
             "pending_analysis"
         ):
+            if person is not None:
+                # A person scans nothing itself; each username is scanned on
+                # its own. The card says which.
+                return
             # The button is the pointer, not the action: this pane cannot scan.
             self.post_message(self.ScanWithAnalysis(username))
             return
-        self._synthesize(username, rebuild=record.get("profile") is not None)
+        self._synthesize(
+            username,
+            rebuild=record.get("profile") is not None,
+            person=person is not None,
+        )
 
     class ScanWithAnalysis(Message):
         """Asked to go and collect the evidence a profile needs.
@@ -1983,7 +2504,9 @@ class ResultsPane(Vertical):
             self.username = username
 
     @work(exclusive=True, group="results-build")
-    async def _synthesize(self, username: str, *, rebuild: bool = False) -> None:
+    async def _synthesize(
+        self, username: str, *, rebuild: bool = False, person: bool = False
+    ) -> None:
         """Build or rebuild the profile from evidence already on disk.
 
         `run_synthesis_only` is the CLI's own `--ai-synthesize-only` path, used
@@ -2008,7 +2531,10 @@ class ResultsPane(Vertical):
         self._set_building(True)
         try:
             failures = await run_synthesis_only(
-                usernames=[username],
+                # A person's build reads every linked username's pages, and
+                # builds only the person's profile -- not each username's.
+                usernames=[] if person else [username],
+                people=[username] if person else (),
                 force=rebuild,
                 inline_anchors=list(self._build_anchors),
                 reporter=reporter,
@@ -2025,7 +2551,7 @@ class ResultsPane(Vertical):
                 Text("Stopped. The stored profile was left as it was.", style="dim")
             )
             self.query_one("#profile-status", Static).display = True
-            self._reload_after_stop(username)
+            self._reload_after_stop(person_key(username) if person else username)
             raise
         except Exception as error:
             # Broad on purpose, as everywhere else here: a failed synthesis
@@ -2047,7 +2573,7 @@ class ResultsPane(Vertical):
 
         self._set_building(False)
         self.notify(f"Profile built for {username}.")
-        self._select(username)
+        self._select(person_key(username) if person else username)
 
     def _reload_after_stop(self, username: str) -> None:
         """Re-read the record so pages read before the stop are counted."""
@@ -2074,6 +2600,12 @@ class ResultsPane(Vertical):
         one state, disagreeing, is what made the section read as improvised; one
         owner per state is the fix, and the card is that owner.
         """
+        if record.get("profile_unreadable") and record.get("person") is not None:
+            return Text(
+                "A profile is stored but no longer matches the current format. "
+                "Rebuild it with the button above.",
+                style=tone("warning"),
+            )
         if record.get("profile_unreadable"):
             return Text(
                 "A profile is stored but no longer matches the current "
