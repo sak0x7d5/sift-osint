@@ -13,10 +13,10 @@ import json
 
 import pytest
 
-from sherlock_project.ai_engine import AIService
-from sherlock_project.database import PersonError, SherlockDB
-from sherlock_project.person_links import AccountEvidence, suggest_links
-from sherlock_project.profile_synthesis import (
+from sift_osint.ai_engine import AIService
+from sift_osint.database import PersonError, SiftDB
+from sift_osint.person_links import AccountEvidence, suggest_links
+from sift_osint.profile_synthesis import (
     InvestigationContext,
     ProfileSynthesis,
     SiteExtraction,
@@ -25,8 +25,8 @@ from sherlock_project.profile_synthesis import (
     aggregate_synthesis,
     compute_synthesis_input_hash,
 )
-from sherlock_project.result import QueryStatus
-from sherlock_project.synthesis_pipeline import (
+from sift_osint.result import QueryStatus
+from sift_osint.synthesis_pipeline import (
     synthesize_person_profile,
     synthesize_username_profile,
 )
@@ -35,7 +35,7 @@ CONTRACT = "pass-one-contract-v2"
 
 
 async def _claimed(
-    db: SherlockDB, username: str, site: str, facts: dict | None = None
+    db: SiftDB, username: str, site: str, facts: dict | None = None
 ) -> int:
     site_id = await db.save_result(
         username=username,
@@ -51,7 +51,7 @@ async def _claimed(
     return site_id
 
 
-async def _hash_of(db: SherlockDB, name: str) -> str | None:
+async def _hash_of(db: SiftDB, name: str) -> str | None:
     cache = await db.get_person_profile_cache(name)
     return cache.input_hash if cache else None
 
@@ -59,7 +59,7 @@ async def _hash_of(db: SherlockDB, name: str) -> str | None:
 # -- storage --------------------------------------------------------------
 
 
-async def test_create_link_and_list_a_person(db: SherlockDB):
+async def test_create_link_and_list_a_person(db: SiftDB):
     await _claimed(db, "alice", "GitHub")
     await _claimed(db, "alice_dev", "GitLab")
     await db.create_person("Alice Smith")
@@ -78,7 +78,7 @@ async def test_create_link_and_list_a_person(db: SherlockDB):
     }
 
 
-async def test_names_are_trimmed_and_must_be_unique(db: SherlockDB):
+async def test_names_are_trimmed_and_must_be_unique(db: SiftDB):
     await db.create_person("  Alice   Smith ")
     assert [p.name for p in await db.list_people()] == ["Alice Smith"]
     with pytest.raises(PersonError):
@@ -87,7 +87,7 @@ async def test_names_are_trimmed_and_must_be_unique(db: SherlockDB):
         await db.create_person("   ")
 
 
-async def test_a_username_belongs_to_at_most_one_person(db: SherlockDB):
+async def test_a_username_belongs_to_at_most_one_person(db: SiftDB):
     await _claimed(db, "alice", "GitHub")
     await db.create_person("A")
     await db.create_person("B")
@@ -98,7 +98,7 @@ async def test_a_username_belongs_to_at_most_one_person(db: SherlockDB):
         await db.link_username("B", "alice")
 
 
-async def test_linking_needs_a_stored_username_and_a_person(db: SherlockDB):
+async def test_linking_needs_a_stored_username_and_a_person(db: SiftDB):
     await db.create_person("A")
     with pytest.raises(PersonError, match="nothing is stored"):
         await db.link_username("A", "ghost")
@@ -107,7 +107,7 @@ async def test_linking_needs_a_stored_username_and_a_person(db: SherlockDB):
         await db.link_username("Nobody", "alice")
 
 
-async def test_deleting_a_person_keeps_every_username_and_result(db: SherlockDB):
+async def test_deleting_a_person_keeps_every_username_and_result(db: SiftDB):
     await _claimed(db, "alice", "GitHub")
     await db.create_person("A")
     await db.link_username("A", "alice")
@@ -119,7 +119,7 @@ async def test_deleting_a_person_keeps_every_username_and_result(db: SherlockDB)
     assert await db.get_person_of("alice") is None
 
 
-async def test_deleting_a_username_removes_its_link(db: SherlockDB):
+async def test_deleting_a_username_removes_its_link(db: SiftDB):
     await _claimed(db, "alice", "GitHub")
     await _claimed(db, "alice_dev", "GitHub")
     await db.create_person("A")
@@ -133,7 +133,7 @@ async def test_deleting_a_username_removes_its_link(db: SherlockDB):
     assert await _hash_of(db, "A") is None
 
 
-async def test_an_extraction_write_invalidates_the_persons_profile(db: SherlockDB):
+async def test_an_extraction_write_invalidates_the_persons_profile(db: SiftDB):
     site_id = await _claimed(db, "alice", "GitHub", {"roles": ["x"]})
     await db.create_person("A")
     await db.link_username("A", "alice")
@@ -145,7 +145,7 @@ async def test_an_extraction_write_invalidates_the_persons_profile(db: SherlockD
     assert await _hash_of(db, "A") is None
 
 
-async def test_link_unlink_and_rename_each_invalidate(db: SherlockDB):
+async def test_link_unlink_and_rename_each_invalidate(db: SiftDB):
     await _claimed(db, "alice", "GitHub")
     await db.create_person("A")
     for change in (
@@ -161,7 +161,7 @@ async def test_link_unlink_and_rename_each_invalidate(db: SherlockDB):
     assert await db.unlink_username("Alice", "alice") is False
 
 
-async def test_person_evidence_carries_each_rows_username(db: SherlockDB):
+async def test_person_evidence_carries_each_rows_username(db: SiftDB):
     await _claimed(db, "alice", "GitHub", {"roles": ["x"]})
     await _claimed(db, "alice_dev", "GitHub", {"roles": ["y"]})
     await _claimed(db, "bob", "GitHub", {"roles": ["z"]})
@@ -276,7 +276,7 @@ class _Service:
         return await self._inner.synthesize(**kwargs)
 
 
-async def test_person_profile_is_built_cached_and_stored_separately(db: SherlockDB):
+async def test_person_profile_is_built_cached_and_stored_separately(db: SiftDB):
     await _claimed(db, "alice", "GitHub", {"full_name": ["Alice Smith"]})
     await _claimed(db, "alice_dev", "GitLab", {"roles": ["Engineer"]})
     await db.create_person("Alice Smith")
@@ -314,7 +314,7 @@ async def test_person_profile_is_built_cached_and_stored_separately(db: Sherlock
     assert third.profile.strong_profile == {"full_name": ["Alice Smith"]}
 
 
-async def test_a_person_and_a_username_of_the_same_name_hash_apart(db: SherlockDB):
+async def test_a_person_and_a_username_of_the_same_name_hash_apart(db: SiftDB):
     await _claimed(db, "alice", "GitHub", {"roles": ["x"]})
     await db.create_person("alice")
     service = _Service()
@@ -327,7 +327,7 @@ async def test_a_person_and_a_username_of_the_same_name_hash_apart(db: SherlockD
     assert username.profile.input_hash != person.profile.input_hash
 
 
-async def test_building_an_unknown_person_says_so(db: SherlockDB):
+async def test_building_an_unknown_person_says_so(db: SiftDB):
     with pytest.raises(PersonError):
         await synthesize_person_profile(
             db=db, ai_service=_Service(), person="Nobody", context=InvestigationContext()
@@ -408,8 +408,8 @@ def test_pairs_in_one_person_are_skipped_and_two_people_are_flagged():
 
 def test_an_anchor_equal_to_the_persons_name_still_matches():
     """The deterministic round must not treat the person's name as a handle."""
-    from sherlock_project.global_synthesis import deterministic_round, site_refs
-    from sherlock_project.profile_synthesis import IdentityAnchor
+    from sift_osint.global_synthesis import deterministic_round, site_refs
+    from sift_osint.profile_synthesis import IdentityAnchor
 
     sites = site_refs(
         [
@@ -432,8 +432,8 @@ def test_an_anchor_equal_to_the_persons_name_still_matches():
 
 def test_an_anchor_equal_to_a_linked_handle_is_not_evidence():
     """A page found UNDER the anchored handle trivially carries it; no match."""
-    from sherlock_project.global_synthesis import deterministic_round, site_refs
-    from sherlock_project.profile_synthesis import IdentityAnchor
+    from sift_osint.global_synthesis import deterministic_round, site_refs
+    from sift_osint.profile_synthesis import IdentityAnchor
 
     sites = site_refs(
         [

@@ -72,7 +72,7 @@ below follows from one of them:
 | `ai_config.py` / `ai_setup.py` | Persistent endpoint config and its wizard | Config lives in the user config dir |
 | `investigation_context.py` | `--anchor` parsing and deduplication | Anchors are per-run, never persisted |
 | `person_links.py` | Suggest links between stored usernames | Pure apart from one read-only loader; never writes |
-| `person_cli.py` | `sherlock-rm person ...` | Intercepted from argv like `show` and `ui` |
+| `person_cli.py` | `sift-osint person ...` | Intercepted from argv like `show` and `ui` |
 | `pass_one_runtime.py` | Seed known key names from prior extractions | Keeps Pass 1 key naming stable across sites |
 | `notify.py` | Every byte of terminal output | `rich`-based; no other module prints |
 | `result.py` | `QueryStatus`, `QueryResult` | Inherited from upstream |
@@ -302,11 +302,11 @@ caller cannot forget to do this because a caller never does it.
 **The database follows the user, not the working directory.**
 `default_database_path()` resolves to the per-user data dir
 (`%LOCALAPPDATA%\sherlock\sherlock.db` on Windows), overridable with
-`SHERLOCK_DB`. A relative path would start an empty database whenever the tool
+`SIFT_DB`. A relative path would start an empty database whenever the tool
 was invoked from a different directory, silently discarding the extraction cache
 and scattering scan data. This was a real regression that has already been fixed
 once; do not reintroduce it. The same rule applies to `ai_config_path()` and
-`SHERLOCK_CONFIG`.
+`SIFT_CONFIG`.
 
 `response_text` is stored in full. It is the input to Pass 1, so retention is
 what makes re-extraction possible without re-scanning — and it is also why the

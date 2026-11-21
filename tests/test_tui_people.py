@@ -12,16 +12,16 @@ import json
 from test_tui import _open_results, _settle
 from textual.widgets import DataTable, Static
 
-from sherlock_project.ai_engine import pass_one_contract_hash
-from sherlock_project.database import SherlockDB, default_database_path
-from sherlock_project.result import QueryStatus
-from sherlock_project.tui.app import SherlockUI
-from sherlock_project.tui.person_screen import (
+from sift_osint.ai_engine import pass_one_contract_hash
+from sift_osint.database import SiftDB, default_database_path
+from sift_osint.result import QueryStatus
+from sift_osint.tui.app import SiftUI
+from sift_osint.tui.person_screen import (
     ChoiceScreen,
     LinkSuggestionsScreen,
     NameScreen,
 )
-from sherlock_project.tui.results_pane import (
+from sift_osint.tui.results_pane import (
     SEC_SITES,
     SUGGESTIONS_KEY,
     ResultsPane,
@@ -31,7 +31,7 @@ from sherlock_project.tui.results_pane import (
 
 async def _seed(rows, people=None) -> None:
     """rows: (username, site, url, facts). people: {name: [usernames]}."""
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         for username, site, url, facts in rows:
             site_id = await db.save_result(
@@ -100,7 +100,7 @@ def _pane(app) -> ResultsPane:
 
 async def test_a_person_heads_its_usernames_in_the_list():
     await _seed(ROWS, people={"Alice Smith": ["alice", "alice_dev"]})
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         await _settle(app, pilot, lambda: len(_list_keys(app)) >= 4)
@@ -118,7 +118,7 @@ async def test_a_person_heads_its_usernames_in_the_list():
 
 async def test_opening_a_person_shows_every_linked_account_labelled():
     await _seed(ROWS, people={"Alice Smith": ["alice", "alice_dev"]})
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         pane = _pane(app)
@@ -138,7 +138,7 @@ async def test_opening_a_person_shows_every_linked_account_labelled():
 
 async def test_a_linked_username_names_its_person_and_p_opens_it():
     await _seed(ROWS, people={"Alice Smith": ["alice"]})
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         pane = _pane(app)
@@ -154,7 +154,7 @@ async def test_a_linked_username_names_its_person_and_p_opens_it():
 
 async def test_adding_a_username_to_a_new_person_creates_and_links_it():
     await _seed(ROWS)
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         pane = _pane(app)
@@ -169,7 +169,7 @@ async def test_adding_a_username_to_a_new_person_creates_and_links_it():
         await pilot.press("enter")
         await _settle(app, pilot, lambda: person_key("Robert") in _list_keys(app))
 
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         assert await db.get_person_usernames("Robert") == ["bob"]
     finally:
@@ -178,7 +178,7 @@ async def test_adding_a_username_to_a_new_person_creates_and_links_it():
 
 async def test_suggested_links_are_offered_and_accepting_one_links_the_pair():
     await _seed(ROWS)
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         await _settle(app, pilot, lambda: SUGGESTIONS_KEY in _list_keys(app))
@@ -195,7 +195,7 @@ async def test_suggested_links_are_offered_and_accepting_one_links_the_pair():
         # Linked, so no longer suggested.
         assert SUGGESTIONS_KEY not in _list_keys(app)
 
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         assert sorted(await db.get_person_usernames("alice")) == ["alice", "alice_dev"]
     finally:
@@ -204,7 +204,7 @@ async def test_suggested_links_are_offered_and_accepting_one_links_the_pair():
 
 async def test_dismissing_a_suggestion_writes_nothing():
     await _seed(ROWS)
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         await _settle(app, pilot, lambda: SUGGESTIONS_KEY in _list_keys(app))
@@ -213,7 +213,7 @@ async def test_dismissing_a_suggestion_writes_nothing():
         await pilot.press("d")
         await _settle(app, pilot, lambda: SUGGESTIONS_KEY not in _list_keys(app))
 
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         assert await db.list_people() == []
     finally:
@@ -222,7 +222,7 @@ async def test_dismissing_a_suggestion_writes_nothing():
 
 async def test_removing_a_person_keeps_its_usernames():
     await _seed(ROWS, people={"Alice Smith": ["alice", "alice_dev"]})
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         pane = _pane(app)
@@ -243,7 +243,7 @@ async def test_removing_a_person_keeps_its_usernames():
 
 async def test_building_a_person_profile_merges_both_usernames():
     await _seed(ROWS, people={"Alice Smith": ["alice", "alice_dev"]})
-    app = SherlockUI()
+    app = SiftUI()
     async with app.run_test(size=(130, 40)) as pilot:
         await _open_results(app, pilot)
         pane = _pane(app)

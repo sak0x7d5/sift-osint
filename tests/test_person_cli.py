@@ -1,4 +1,4 @@
-"""`sherlock-rm person ...` against a real (temporary) database.
+"""`sift-osint person ...` against a real (temporary) database.
 
 `list`, `show` and `suggest` must never write; every other subcommand makes the
 one change its name says, and `delete` keeps the usernames.
@@ -10,14 +10,14 @@ import json
 
 import pytest
 
-from sherlock_project.ai_engine import pass_one_contract_hash
-from sherlock_project.database import SherlockDB, default_database_path
-from sherlock_project.person_cli import run_person
-from sherlock_project.result import QueryStatus
+from sift_osint.ai_engine import pass_one_contract_hash
+from sift_osint.database import SiftDB, default_database_path
+from sift_osint.person_cli import run_person
+from sift_osint.result import QueryStatus
 
 
 async def _seed() -> None:
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         for username, site, facts in (
             ("alice", "GitHub", {"full_name": ["Alice Smith"], "email": ["a@x.io"]}),
@@ -41,7 +41,7 @@ async def _seed() -> None:
 
 
 async def _people() -> dict[str, list[str]]:
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         return {p.name: list(p.usernames) for p in await db.list_people()}
     finally:
@@ -90,7 +90,7 @@ async def test_delete_needs_yes_without_a_terminal_and_keeps_usernames(monkeypat
     assert await _people() == {"A": ["alice"]}
     assert await run_person(["delete", "A", "--yes"]) == 0
     assert await _people() == {}
-    db = await SherlockDB.create(str(default_database_path()))
+    db = await SiftDB.create(str(default_database_path()))
     try:
         assert {u.username for u in await db.list_usernames()} == {"alice", "alice_dev"}
     finally:
@@ -113,7 +113,7 @@ async def test_build_of_an_unknown_person_fails():
 def test_person_is_dispatched_before_the_scan_parser(monkeypatch):
     import asyncio
 
-    from sherlock_project import sherlock as sherlock_module
+    from sift_osint import sherlock as sherlock_module
 
     seen = {}
 
@@ -121,8 +121,8 @@ def test_person_is_dispatched_before_the_scan_parser(monkeypatch):
         seen["argv"] = argv
         return 0
 
-    monkeypatch.setattr("sherlock_project.person_cli.run_person", fake)
-    monkeypatch.setattr("sys.argv", ["sherlock-rm", "person", "list"])
+    monkeypatch.setattr("sift_osint.person_cli.run_person", fake)
+    monkeypatch.setattr("sys.argv", ["sift-osint", "person", "list"])
     assert asyncio.run(sherlock_module.main()) == 0
     assert seen["argv"] == ["list"]
 
