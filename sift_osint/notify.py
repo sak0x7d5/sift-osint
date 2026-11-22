@@ -8,7 +8,7 @@ import webbrowser
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from rich.console import Console, Group, RenderableType
 from rich.panel import Panel
@@ -202,6 +202,17 @@ class QueryNotify:
 
     def __str__(self) -> str:
         return str(self.result)
+
+
+def source_label(decision: Any) -> str:
+    """A source's name as a reader needs it: with its username on a person.
+
+    On a person profile "GitHub" can name two accounts, one per linked
+    username, so the username goes beside it. A username profile's sources are
+    all that username's, and naming it on every line would only be noise.
+    """
+    username = getattr(decision, "username", None)
+    return f"{decision.site_name} ({username})" if username else decision.site_name
 
 
 class TerminalReporter(QueryNotify):
@@ -1389,14 +1400,14 @@ class TerminalReporter(QueryNotify):
         route passes its own, and one with none passes None.
         """
         site_names = {
-            decision.site_id: decision.site_name
+            decision.site_id: source_label(decision)
             for decision in profile.source_decisions
         }
         site_urls = {
             decision.site_id: (
-                f"{decision.site_name} - {decision.site_url}"
+                f"{source_label(decision)} - {decision.site_url}"
                 if decision.site_url
-                else decision.site_name
+                else source_label(decision)
             )
             for decision in profile.source_decisions
         }
@@ -1526,8 +1537,15 @@ class TerminalReporter(QueryNotify):
         if caveat_stated:
             notes.append(
                 Text(
-                    "[!] No anchors used, so these values may describe "
-                    "different people who share this username.",
+                    (
+                        "[!] No anchors used, so any one linked account may "
+                        "still be someone else's."
+                    )
+                    if profile.person is not None
+                    else (
+                        "[!] No anchors used, so these values may describe "
+                        "different people who share this username."
+                    ),
                     style="yellow",
                 )
             )
@@ -1590,7 +1608,11 @@ class TerminalReporter(QueryNotify):
         self._write(
             Panel(
                 Group(*blocks),
-                title=f"Profile: {profile.username}",
+                title=(
+                    f"Person: {profile.person}"
+                    if profile.person is not None
+                    else f"Profile: {profile.username}"
+                ),
                 title_align="left",
                 border_style="cyan" if not self.no_color else "none",
                 padding=(0, 1),
@@ -1622,7 +1644,7 @@ class TerminalReporter(QueryNotify):
         populated = False
         for label, predicate in source_groups:
             sites = [
-                decision.site_name
+                source_label(decision)
                 for decision in profile.source_decisions
                 if predicate(decision)
             ]
